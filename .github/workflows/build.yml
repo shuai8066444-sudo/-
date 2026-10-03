@@ -1,0 +1,545 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Tools
+        run: |
+          which xcodegen || brew install xcodegen
+
+      - name: Prepare Project Files
+        run: |
+          mkdir -p App Keyboard
+          
+          # App 主入口
+          cat << 'EOF' > App/App.swift
+          import SwiftUI
+
+          @main
+          struct LearningKeyboardApp: App {
+              var body: some Scene {
+                  WindowGroup {
+                      ContentView()
+                  }
+              }
+          }
+
+          struct ContentView: View {
+              @State private var testText = ""
+              var body: some View {
+                  VStack(spacing: 24) {
+                      Text("中英伴随学习键盘")
+                          .font(.title2)
+                          .fontWeight(.bold)
+                      
+                      VStack(alignment: .leading, spacing: 12) {
+                          Text("键盘启用步骤：")
+                              .font(.headline)
+                          Text("1. 打开 iPhone【设置】->【通用】->【键盘】")
+                          Text("2. 点击【键盘】->【添加新键盘...】")
+                          Text("3. 选择【中英学习键盘】")
+                      }
+                      .padding()
+                      .background(Color(UIColor.secondarySystemBackground))
+                      .cornerRadius(12)
+                      
+                      TextField("点击此处测试输入法...", text: $testText)
+                          .textFieldStyle(RoundedBorderTextFieldStyle())
+                          .padding(.horizontal)
+                  }
+                  .padding()
+              }
+          }
+          EOF
+
+          # Keyboard 配置
+          cat << 'EOF' > Keyboard/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleDisplayName</key>
+              <string>中英学习键盘</string>
+              <key>CFBundlePackageType</key>
+              <string>XPC!</string>
+              <key>NSExtension</key>
+              <dict>
+                  <key>NSExtensionAttributes</key>
+                  <dict>
+                      <key>IsASCIICapable</key>
+                      <false/>
+                      <key>PrefersRightToLeft</key>
+                      <false/>
+                      <key>PrimaryLanguage</key>
+                      <string>zh-Hans</string>
+                      <key>RequestsOpenAccess</key>
+                      <false/>
+                  </dict>
+                  <key>NSExtensionPointIdentifier</key>
+                  <string>com.apple.keyboard-service</string>
+                  <key>NSExtensionPrincipalClass</key>
+                  <string>$(PRODUCT_MODULE_NAME).KeyboardViewController</string>
+              </dict>
+          </dict>
+          </plist>
+          EOF
+
+          # 词典数据
+          cat << 'EOF' > Keyboard/LocalDictionaryService.swift
+          import Foundation
+
+          struct VocabularyCard {
+              let chinese: String
+              let english: String
+              let phonetic: String?
+          }
+
+          class LocalDictionaryService {
+              static let shared = LocalDictionaryService()
+
+              private let pinyinMap: [String: [String]] = [
+                  "ni": ["你", "拟", "泥"],
+                  "hao": ["好", "号", "毫"],
+                  "nihao": ["你好"],
+                  "pingguo": ["苹果"],
+                  "xuexi": ["学习"],
+                  "kafei": ["咖啡"],
+                  "gongzuo": ["工作"],
+                  "kaixin": ["开心"],
+                  "pengyou": ["朋友"],
+                  "xiexie": ["谢谢"],
+                  "zao": ["早", "造"],
+                  "wan": ["晚", "玩"]
+              ]
+
+              private let dictMap: [String: VocabularyCard] = [
+                  "你好": VocabularyCard(chinese: "你好", english: "Hello / Hi", phonetic: "həˈləʊ"),
+                  "苹果": VocabularyCard(chinese: "苹果", english: "apple", phonetic: "ˈæpl"),
+                  "学习": VocabularyCard(chinese: "学习", english: "learn / study", phonetic: "lɜːn"),
+                  "咖啡": VocabularyCard(chinese: "咖啡", english: "coffee", phonetic: "ˈkɒfi"),
+                  "工作": VocabularyCard(chinese: "工作", english: "work / job", phonetic: "wɜːk"),
+                  "开心": VocabularyCard(chinese: "开心", english: "happy / glad", phonetic: "ˈhæpi"),
+                  "朋友": VocabularyCard(chinese: "朋友", english: "friend", phonetic: "frend"),
+                  "谢谢": VocabularyCard(chinese: "谢谢", english: "thank you", phonetic: "θæŋk juː"),
+                  "早": VocabularyCard(chinese: "早", english: "morning / early", phonetic: "ˈmɔːnɪŋ"),
+                  "晚": VocabularyCard(chinese: "晚", english: "evening / late", phonetic: "leɪt")
+              ]
+
+              func getCandidates(for pinyin: String) -> [String] {
+                  return pinyinMap[pinyin] ?? [pinyin]
+              }
+
+              func lookup(chinese: String) -> VocabularyCard? {
+                  return dictMap[chinese]
+              }
+          }
+          EOF
+
+          # 键盘界面与交互逻辑
+          cat << 'EOF' > Keyboard/KeyboardViewController.swift
+          import UIKit
+
+          class KeyboardViewController: UIInputViewController {
+
+              private let lightHaptic = UIImpactFeedbackGenerator(style: .light)
+              private let mediumHaptic = UIImpactFeedbackGenerator(style: .medium)
+
+              private var blurBackgroundView: UIVisualEffectView!
+              private let topLearningBar = UIView()
+              private let englishLabel = UILabel()
+              private let phoneticLabel = UILabel()
+              private let replaceButton = UIButton(type: .system)
+              
+              private let candidateScrollView = UIScrollView()
+              private let candidateStackView = UIStackView()
+              private let keyboardStackView = UIStackView()
+
+              private var currentPinyin = ""
+              private var lastMatchedCard: VocabularyCard?
+
+              private let row1 = ["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"]
+              private let row2 = ["a", "s", "d", "f", "g", "h", "j", "k", "l"]
+              private let row3 = ["z", "x", "c", "v", "b", "n", "m"]
+
+              override func viewDidLoad() {
+                  super.viewDidLoad()
+                  lightHaptic.prepare()
+                  mediumHaptic.prepare()
+                  setupUI()
+              }
+
+              private func setupUI() {
+                  let blurEffect = UIBlurEffect(style: .systemMaterial)
+                  blurBackgroundView = UIVisualEffectView(effect: blurEffect)
+                  blurBackgroundView.translatesAutoresizingMaskIntoConstraints = false
+                  view.addSubview(blurBackgroundView)
+
+                  setupTopLearningBar()
+                  setupCandidateBar()
+                  setupKeyboardRows()
+
+                  NSLayoutConstraint.activate([
+                      blurBackgroundView.topAnchor.constraint(equalTo: view.topAnchor),
+                      blurBackgroundView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+                      blurBackgroundView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+                      blurBackgroundView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+
+                      topLearningBar.topAnchor.constraint(equalTo: view.topAnchor, constant: 6),
+                      topLearningBar.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
+                      topLearningBar.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
+                      topLearningBar.heightAnchor.constraint(equalToConstant: 38),
+
+                      candidateScrollView.topAnchor.constraint(equalTo: topLearningBar.bottomAnchor, constant: 4),
+                      candidateScrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+                      candidateScrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+                      candidateScrollView.heightAnchor.constraint(equalToConstant: 34),
+
+                      keyboardStackView.topAnchor.constraint(equalTo: candidateScrollView.bottomAnchor, constant: 6),
+                      keyboardStackView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 4),
+                      keyboardStackView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -4),
+                      keyboardStackView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -6)
+                  ])
+              }
+
+              private func setupTopLearningBar() {
+                  topLearningBar.translatesAutoresizingMaskIntoConstraints = false
+                  topLearningBar.backgroundColor = UIColor.label.withAlphaComponent(0.06)
+                  topLearningBar.layer.cornerRadius = 10
+                  topLearningBar.layer.masksToBounds = true
+                  view.addSubview(topLearningBar)
+
+                  englishLabel.translatesAutoresizingMaskIntoConstraints = false
+                  englishLabel.font = .systemFont(ofSize: 14, weight: .semibold)
+                  englishLabel.textColor = .label
+                  englishLabel.text = "打字即现英文翻译"
+
+                  phoneticLabel.translatesAutoresizingMaskIntoConstraints = false
+                  phoneticLabel.font = .systemFont(ofSize: 12, weight: .regular)
+                  phoneticLabel.textColor = .secondaryLabel
+
+                  replaceButton.translatesAutoresizingMaskIntoConstraints = false
+                  replaceButton.setTitle("一键上屏", for: .normal)
+                  replaceButton.titleLabel?.font = .systemFont(ofSize: 12, weight: .bold)
+                  replaceButton.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.85)
+                  replaceButton.setTitleColor(.white, for: .normal)
+                  replaceButton.layer.cornerRadius = 6
+                  replaceButton.isHidden = true
+                  replaceButton.addTarget(self, action: #selector(didTapReplace), for: .touchUpInside)
+
+                  topLearningBar.addSubview(englishLabel)
+                  topLearningBar.addSubview(phoneticLabel)
+                  topLearningBar.addSubview(replaceButton)
+
+                  NSLayoutConstraint.activate([
+                      englishLabel.leadingAnchor.constraint(equalTo: topLearningBar.leadingAnchor, constant: 10),
+                      englishLabel.centerYAnchor.constraint(equalTo: topLearningBar.centerYAnchor),
+
+                      phoneticLabel.leadingAnchor.constraint(equalTo: englishLabel.trailingAnchor, constant: 6),
+                      phoneticLabel.centerYAnchor.constraint(equalTo: topLearningBar.centerYAnchor),
+
+                      replaceButton.trailingAnchor.constraint(equalTo: topLearningBar.trailingAnchor, constant: -6),
+                      replaceButton.centerYAnchor.constraint(equalTo: topLearningBar.centerYAnchor),
+                      replaceButton.widthAnchor.constraint(equalToConstant: 68),
+                      replaceButton.heightAnchor.constraint(equalToConstant: 26)
+                  ])
+              }
+
+              private func setupCandidateBar() {
+                  candidateScrollView.translatesAutoresizingMaskIntoConstraints = false
+                  candidateScrollView.showsHorizontalScrollIndicator = false
+                  view.addSubview(candidateScrollView)
+
+                  candidateStackView.translatesAutoresizingMaskIntoConstraints = false
+                  candidateStackView.axis = .horizontal
+                  candidateStackView.spacing = 10
+                  candidateStackView.alignment = .center
+                  candidateScrollView.addSubview(candidateStackView)
+
+                  NSLayoutConstraint.activate([
+                      candidateStackView.topAnchor.constraint(equalTo: candidateScrollView.topAnchor),
+                      candidateStackView.bottomAnchor.constraint(equalTo: candidateScrollView.bottomAnchor),
+                      candidateStackView.leadingAnchor.constraint(equalTo: candidateScrollView.leadingAnchor, constant: 12),
+                      candidateStackView.trailingAnchor.constraint(equalTo: candidateScrollView.trailingAnchor, constant: -12),
+                      candidateStackView.heightAnchor.constraint(equalTo: candidateScrollView.heightAnchor)
+                  ])
+              }
+
+              private func setupKeyboardRows() {
+                  keyboardStackView.translatesAutoresizingMaskIntoConstraints = false
+                  keyboardStackView.axis = .vertical
+                  keyboardStackView.distribution = .fillEqually
+                  keyboardStackView.spacing = 7
+                  view.addSubview(keyboardStackView)
+
+                  keyboardStackView.addArrangedSubview(createRowStack(letters: row1))
+
+                  let row2Stack = createRowStack(letters: row2)
+                  row2Stack.layoutMargins = UIEdgeInsets(top: 0, left: 16, bottom: 0, right: 16)
+                  row2Stack.isLayoutMarginsRelativeArrangement = true
+                  keyboardStackView.addArrangedSubview(row2Stack)
+
+                  let row3Stack = UIStackView()
+                  row3Stack.axis = .horizontal
+                  row3Stack.distribution = .fillProportionally
+                  row3Stack.spacing = 6
+
+                  let shiftBtn = createSpecialKey(title: "⇧", weight: 1.3, action: #selector(didTapShift))
+                  let deleteBtn = createSpecialKey(title: "⌫", weight: 1.3, action: #selector(didTapDelete))
+                  row3Stack.addArrangedSubview(shiftBtn)
+                  for letter in row3 {
+                      row3Stack.addArrangedSubview(createKeyButton(title: letter))
+                  }
+                  row3Stack.addArrangedSubview(deleteBtn)
+                  keyboardStackView.addArrangedSubview(row3Stack)
+
+                  let row4Stack = UIStackView()
+                  row4Stack.axis = .horizontal
+                  row4Stack.distribution = .fillProportionally
+                  row4Stack.spacing = 6
+
+                  let globeBtn = createSpecialKey(title: "切换", weight: 1.2, action: #selector(handleInputModeList(from:with:)))
+                  let spaceBtn = createSpecialKey(title: "空格", weight: 4.5, action: #selector(didTapSpace))
+                  let returnBtn = createSpecialKey(title: "换行", weight: 1.8, action: #selector(didTapReturn))
+                  returnBtn.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.8)
+                  returnBtn.setTitleColor(.white, for: .normal)
+
+                  row4Stack.addArrangedSubview(globeBtn)
+                  row4Stack.addArrangedSubview(spaceBtn)
+                  row4Stack.addArrangedSubview(returnBtn)
+                  keyboardStackView.addArrangedSubview(row4Stack)
+              }
+
+              private func createRowStack(letters: [String]) -> UIStackView {
+                  let stack = UIStackView()
+                  stack.axis = .horizontal
+                  stack.distribution = .fillEqually
+                  stack.spacing = 5
+                  for letter in letters {
+                      stack.addArrangedSubview(createKeyButton(title: letter))
+                  }
+                  return stack
+              }
+
+              private func createKeyButton(title: String) -> UIButton {
+                  let btn = UIButton(type: .custom)
+                  btn.setTitle(title, for: .normal)
+                  btn.setTitleColor(.label, for: .normal)
+                  btn.titleLabel?.font = .systemFont(ofSize: 21, weight: .regular)
+                  btn.backgroundColor = UIColor.tertiarySystemBackground.withAlphaComponent(0.85)
+                  btn.layer.cornerRadius = 6
+                  btn.layer.shadowColor = UIColor.black.cgColor
+                  btn.layer.shadowOffset = CGSize(width: 0, height: 1)
+                  btn.layer.shadowOpacity = 0.15
+                  btn.layer.shadowRadius = 0.5
+
+                  btn.addTarget(self, action: #selector(keyTouchDown(_:)), for: .touchDown)
+                  btn.addTarget(self, action: #selector(keyTapped(_:)), for: .touchUpInside)
+                  return btn
+              }
+
+              private func createSpecialKey(title: String, weight: CGFloat, action: Selector) -> UIButton {
+                  let btn = UIButton(type: .custom)
+                  btn.setTitle(title, for: .normal)
+                  btn.setTitleColor(.label, for: .normal)
+                  btn.titleLabel?.font = .systemFont(ofSize: 16, weight: .medium)
+                  btn.backgroundColor = UIColor.quaternarySystemFill
+                  btn.layer.cornerRadius = 6
+                  btn.addTarget(self, action: #selector(specialKeyTouchDown(_:)), for: .touchDown)
+                  btn.addTarget(self, action: action, for: .touchUpInside)
+                  return btn
+              }
+
+              @objc private func keyTouchDown(_ sender: UIButton) {
+                  lightHaptic.impactOccurred()
+                  sender.backgroundColor = UIColor.secondarySystemBackground
+              }
+
+              @objc private func specialKeyTouchDown(_ sender: UIButton) {
+                  mediumHaptic.impactOccurred()
+                  sender.backgroundColor = UIColor.tertiarySystemFill
+              }
+
+              @objc private func keyTapped(_ sender: UIButton) {
+                  sender.backgroundColor = UIColor.tertiarySystemBackground.withAlphaComponent(0.85)
+                  guard let char = sender.currentTitle else { return }
+                  currentPinyin.append(char)
+                  updateCandidates()
+              }
+
+              @objc private func didTapDelete(_ sender: UIButton) {
+                  sender.backgroundColor = UIColor.quaternarySystemFill
+                  if !currentPinyin.isEmpty {
+                      currentPinyin.removeLast()
+                      updateCandidates()
+                  } else {
+                      textDocumentProxy.deleteBackward()
+                      updateLearningCardFromContext()
+                  }
+              }
+
+              @objc private func didTapSpace(_ sender: UIButton) {
+                  sender.backgroundColor = UIColor.quaternarySystemFill
+                  if !currentPinyin.isEmpty {
+                      if let firstCandidate = candidateStackView.arrangedSubviews.first as? UIButton,
+                         let text = firstCandidate.currentTitle {
+                          commitText(text)
+                      }
+                  } else {
+                      textDocumentProxy.insertText(" ")
+                  }
+              }
+
+              @objc private func didTapReturn(_ sender: UIButton) {
+                  sender.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.8)
+                  textDocumentProxy.insertText("\n")
+              }
+
+              @objc private func didTapShift(_ sender: UIButton) {
+                  sender.backgroundColor = UIColor.quaternarySystemFill
+              }
+
+              private func updateCandidates() {
+                  candidateStackView.arrangedSubviews.forEach { $0.removeFromSuperview() }
+
+                  guard !currentPinyin.isEmpty else {
+                      updateLearningCardFromContext()
+                      return
+                  }
+
+                  let candidates = LocalDictionaryService.shared.getCandidates(for: currentPinyin)
+                  for (index, cand) in candidates.enumerated() {
+                      let btn = UIButton(type: .system)
+                      btn.setTitle(cand, for: .normal)
+                      btn.setTitleColor(.label, for: .normal)
+                      btn.titleLabel?.font = .systemFont(ofSize: 18, weight: index == 0 ? .semibold : .regular)
+                      btn.tag = index
+                      btn.addTarget(self, action: #selector(didSelectCandidate(_:)), for: .touchUpInside)
+                      candidateStackView.addArrangedSubview(btn)
+                  }
+
+                  if let first = candidates.first {
+                      showLearningCard(for: first)
+                  }
+              }
+
+              @objc private func didSelectCandidate(_ sender: UIButton) {
+                  guard let text = sender.currentTitle else { return }
+                  lightHaptic.impactOccurred()
+                  commitText(text)
+              }
+
+              private func commitText(_ text: String) {
+                  textDocumentProxy.insertText(text)
+                  currentPinyin = ""
+                  updateCandidates()
+                  showLearningCard(for: text)
+              }
+
+              private func showLearningCard(for chineseWord: String) {
+                  if let card = LocalDictionaryService.shared.lookup(chinese: chineseWord) {
+                      lastMatchedCard = card
+                      englishLabel.text = card.english
+                      phoneticLabel.text = card.phonetic != nil ? "[\(card.phonetic!)]" : ""
+                      replaceButton.isHidden = false
+                  } else {
+                      replaceButton.isHidden = true
+                  }
+              }
+
+              @objc private func didTapReplace() {
+                  guard let card = lastMatchedCard else { return }
+                  mediumHaptic.impactOccurred()
+                  for _ in 0..<card.chinese.count {
+                      textDocumentProxy.deleteBackward()
+                  }
+                  textDocumentProxy.insertText(card.english + " ")
+                  replaceButton.isHidden = true
+              }
+
+              private func updateLearningCardFromContext() {
+                  guard let context = textDocumentProxy.documentContextBeforeInput, !context.isEmpty else {
+                      englishLabel.text = "打字即现英文翻译"
+                      phoneticLabel.text = ""
+                      replaceButton.isHidden = true
+                      return
+                  }
+                  let lastChar = String(context.suffix(2))
+                  showLearningCard(for: lastChar)
+              }
+          }
+          EOF
+
+          # XcodeGen 配置 (锁死兼容格式)
+          cat << 'EOF' > project.yml
+          name: LearningKeyboard
+          options:
+            bundleIdPrefix: com.user.learningkeyboard
+            deploymentTarget:
+              iOS: "16.0"
+            xcodeVersion: "15.4"
+          targets:
+            LearningKeyboard:
+              type: application
+              platform: iOS
+              sources: [App]
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.user.learningkeyboard
+                  PRODUCT_NAME: "中英学习键盘"
+                  GENERATE_INFOPLIST_FILE: YES
+                  INFOPLIST_KEY_UILaunchScreen_Generation: YES
+                  INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
+              dependencies:
+                - target: KeyboardExtension
+
+            KeyboardExtension:
+              type: app-extension
+              platform: iOS
+              sources: [Keyboard]
+              info:
+                path: Keyboard/Info.plist
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.user.learningkeyboard.keyboard
+                  PRODUCT_NAME: "中英学习键盘"
+                  GENERATE_INFOPLIST_FILE: NO
+          EOF
+
+      - name: Generate Xcode Project
+        run: |
+          xcodegen generate
+          sed -i '' 's/objectVersion = 77/objectVersion = 60/g' LearningKeyboard.xcodeproj/project.pbxproj 2>/dev/null || true
+
+      - name: Build App
+        run: |
+          xcodebuild build \
+            -project LearningKeyboard.xcodeproj \
+            -scheme LearningKeyboard \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          APP_PATH=$(find build -name "LearningKeyboard.app" -type d | head -n 1)
+          cp -r "$APP_PATH" Payload/
+          zip -r LearningKeyboard.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: LearningKeyboard-IPA
+          path: LearningKeyboard.ipa
