@@ -478,14 +478,13 @@ jobs:
           }
           EOF
 
-          # XcodeGen 配置 (锁死兼容格式)
+          # XcodeGen 配置 (模块名分别命名，彻底解决重名冲突)
           cat << 'EOF' > project.yml
           name: LearningKeyboard
           options:
             bundleIdPrefix: com.user.learningkeyboard
             deploymentTarget:
               iOS: "16.0"
-            xcodeVersion: "15.4"
           targets:
             LearningKeyboard:
               type: application
@@ -494,7 +493,8 @@ jobs:
               settings:
                 base:
                   PRODUCT_BUNDLE_IDENTIFIER: com.user.learningkeyboard
-                  PRODUCT_NAME: "中英学习键盘"
+                  PRODUCT_NAME: LearningKeyboard
+                  INFOPLIST_KEY_CFBundleDisplayName: "中英学习键盘"
                   GENERATE_INFOPLIST_FILE: YES
                   INFOPLIST_KEY_UILaunchScreen_Generation: YES
                   INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
@@ -510,14 +510,12 @@ jobs:
               settings:
                 base:
                   PRODUCT_BUNDLE_IDENTIFIER: com.user.learningkeyboard.keyboard
-                  PRODUCT_NAME: "中英学习键盘"
+                  PRODUCT_NAME: KeyboardExtension
                   GENERATE_INFOPLIST_FILE: NO
           EOF
 
       - name: Generate Xcode Project
-        run: |
-          xcodegen generate
-          sed -i '' 's/objectVersion = 77/objectVersion = 60/g' LearningKeyboard.xcodeproj/project.pbxproj 2>/dev/null || true
+        run: xcodegen generate
 
       - name: Build App
         run: |
