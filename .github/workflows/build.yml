@@ -61,7 +61,7 @@ jobs:
           }
           EOF
 
-          # Keyboard 配置
+          # Keyboard 完整识别配置 Info.plist
           cat << 'EOF' > Keyboard/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -69,8 +69,20 @@ jobs:
           <dict>
               <key>CFBundleDisplayName</key>
               <string>中英学习键盘</string>
+              <key>CFBundleExecutable</key>
+              <string>$(EXECUTABLE_NAME)</string>
+              <key>CFBundleIdentifier</key>
+              <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+              <key>CFBundleInfoDictionaryVersion</key>
+              <string>6.0</string>
+              <key>CFBundleName</key>
+              <string>$(PRODUCT_NAME)</string>
               <key>CFBundlePackageType</key>
               <string>XPC!</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.0</string>
+              <key>CFBundleVersion</key>
+              <string>1</string>
               <key>NSExtension</key>
               <dict>
                   <key>NSExtensionAttributes</key>
@@ -478,7 +490,7 @@ jobs:
           }
           EOF
 
-          # XcodeGen 配置 (模块名分别命名，彻底解决重名冲突)
+          # XcodeGen 配置
           cat << 'EOF' > project.yml
           name: LearningKeyboard
           options:
